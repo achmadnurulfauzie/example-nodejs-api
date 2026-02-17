@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 // Root path - checks database connection
 app.get('/', async (req, res) => {
   try {
-    
+
     await pool.query('SELECT NOW()');
     res.status(200).json({ message: 'Database connection successful', status: 'OK' });
   } catch (err) {
@@ -56,8 +56,9 @@ app.get('/', async (req, res) => {
 // API endpoint /api/cities
 app.get('/api/cities', async (req, res) => {
   try {
-    const client = await pool.connect(); // never released
-    const result = await client.query("SELECT * FROM cities");
+    //const client = await pool.connect(); // never released
+    //const result = await client.query("SELECT * FROM cities");
+    const result = await pool.query('SELECT * FROM cities');
     res.status(200).json(result.rows);
   } catch (err) {
     console.error('Error fetching data from /api/cities:', err);

@@ -1,0 +1,133 @@
+name: release-build-and-deploy
+
+on:
+  push:
+    tags:
+      - "*-release"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: api-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: example-nodejs-api
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      time_tag: ${{ steps.vars.outputs.time_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute tags (WIB)
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="$(TZ=Asia/Jakarta date +'%Y%m%d%H%M')"
+          SHA="${GITHUB_SHA::7}"
+          RUN="${GITHUB_RUN_NUMBER}"
+          GIT_TAG="${GITHUB_REF_NAME}"
+
+          TIME_TAG="${TS}-${GIT_TAG}"
+          RELEASE_TAG="${TS}-${SHA}-${RUN}-${GIT_TAG}"
+
+          echo "time_tag=$TIME_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "TIME_TAG=$TIME_TAG"
+          echo "RELEASE_TAG=$RELEASE_TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR (push)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (2 tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.time_tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.release_tag }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Kirim hanya file base compose (non-secret) ke lokasi sementara di VM
+      - name: Upload compose base to VM (transient)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "deploy/docker-compose.prod.yml"
+          target: "/tmp/api"
+
+      - name: Deploy API only (no .env, no sed, override transient)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            # Base compose ada di /tmp/api/deploy/docker-compose.prod.yml
+            cd /tmp/api/deploy
+
+            # Login GHCR untuk pull image private
+            echo "${{ secrets.GHCR_PULL_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
+
+            # Override file sementara (tmpfs) untuk image tag + DB env
+            sudo mkdir -p /run/cities-api
+            sudo chown $(id -u):$(id -g) /run/cities-api
+            umask 077
+
+            cat > /run/cities-api/docker-compose.override.yml <<EOF
+            services:
+              api:
+                image: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.release_tag }}
+                environment:
+                  DB_HOST: "${{ secrets.DB_HOST }}"
+                  DB_PORT: "${{ secrets.DB_PORT }}"
+                  DB_USER: "${{ secrets.DB_USER }}"
+                  DB_PASSWORD: "${{ secrets.DB_PASSWORD }}"
+                  DB_NAME: "${{ secrets.DB_NAME }}"
+            EOF
+
+            # Deploy hanya service api
+            docker compose -p cities-api \
+              -f docker-compose.prod.yml \
+              -f /run/cities-api/docker-compose.override.yml \
+              pull api
+
+            docker compose -p cities-api \
+              -f docker-compose.prod.yml \
+              -f /run/cities-api/docker-compose.override.yml \
+              up -d api --remove-orphans
+
+            # Cleanup: tidak ada compose/.env tersisa di VM
+            sudo rm -f /run/cities-api/docker-compose.override.yml
+            rm -rf /tmp/api
+
+            docker logout ghcr.io || true
+            docker image prune -af --filter "until=1h" || true
+
+            # Smoke test (gunakan endpoint yang pasti ada)
+            curl -fsS http://127.0.0.1:3000/api/cities >/dev/null

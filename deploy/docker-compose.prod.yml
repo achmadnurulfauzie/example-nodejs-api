@@ -1,0 +1,27 @@
+services:
+  api:
+    image: ghcr.io/placeholder/example-nodejs-api:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NODE_ENV: "production"
+      PORT: "3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/cities >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [appnet]
+
+networks:
+  appnet:
+    external: true
+    name: appnet
